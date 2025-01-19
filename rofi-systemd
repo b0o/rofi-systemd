@@ -1,0 +1,383 @@
+#!/usr/bin/env bash
+#
+# Use rofi to control systemd units.
+# Original source: <https://github.com/IvanMalison/rofi-systemd>
+#
+# Copyright (C) 2020 Maddison Hellstrom <https://github.com/b0o>
+# Copyright (C) 2018 Ivan Malison       <https://github.com/IvanMalison>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+set -Eeuo pipefail
+shopt -s inherit_errexit
+
+declare -g prog
+prog="$(basename "$0")"
+
+declare -g term="alacritty"
+if [[ -v ROFI_SYSTEMD_TERM ]]; then
+  term="$ROFI_SYSTEMD_TERM"
+elif [[ -v TERMINAL ]]; then
+  term="$TERMINAL"
+fi
+
+declare -g exec="${ROFI_SYSTEMD_EXEC:-exec}"
+
+declare -g default_action="${ROFI_SYSTEMD_DEFAULT_ACTION-"list_actions"}"
+
+declare -gi rofi_service_maxlen="${ROFI_SYSTEMD_SERVICE_MAXLEN:-42}"
+
+declare -g CACHE_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+declare -g CACHE_FILE
+
+CACHE_FILE="$(mktemp --tmpdir="$CACHE_DIR" -t "rofi-systemd.XXXXXX")" || {
+  echo "$prog: unable to make temporary file in $CACHE_DIR" >&2
+  exit 1
+}
+
+trap 'rm $CACHE_FILE' EXIT
+
+declare -gra actions=(
+  "enable"
+  "disable"
+  "stop"
+  "start"
+  "restart"
+  "journal"
+  "status"
+  "reset-failed"
+)
+
+declare -grA bindings=(
+  [enable]="Alt+e"
+  ["enable-now"]="Ctrl+E"
+  [disable]="Alt+d"
+  ["disable-now"]="Ctrl+D"
+  [stop]="Ctrl+x"
+  [start]="Ctrl+s"
+  [restart]="Ctrl+r"
+  [journal]="Alt+j"
+  [status]="Alt+s"
+  ["reset-failed"]="Alt+r"
+)
+
+declare -g bindings_help
+bindings_help="$(
+  awk '{ s=$0; gsub(/^ \| /, "", s); gsub(/Alt/, "M", s); gsub(/Ctrl/, "C", s); gsub(/Shift/, "S", s); gsub(/\+/, "-", s); print s }' <<<"$(
+    for a in "${!bindings[@]}"; do printf ' | %s %s' "${bindings["${a}"]}" "$a"; done
+  )"
+)"
+declare -r bindings_help
+
+declare -ga OPTS=("$@")
+declare -g action=""
+declare -g cmd=""
+declare -ga cmd_args=()
+declare -gi c_user=0
+declare -gi c_sudo=0
+declare -gi c_term=0
+
+mapfile -t usage <<EOF
+Usage: $prog [opts] [user|system|all]
+
+Options:
+  -h   Show this help message and exit.
+  -f   Only show failed units.
+  -C   Disable caching.
+
+Control systemd via rofi
+EOF
+
+function usage() {
+  printf '%s\n' "${usage[@]}" >&2
+}
+
+function get_units() {
+  local -a opts=("${@:1:$(($# - 1))}")
+  local scope="${*:$#}"
+  {
+    systemctl "--$scope" list-units --all --no-legend --plain "${opts[@]}" | awk '{print $1 "\t" $3 "\t" $4}' || true
+    systemctl "--$scope" list-unit-files --no-legend --plain "${opts[@]}" | awk '{print $1 "\t" "inactive" "\t" $2}' || true
+  } | awk -v unit_type="$scope" '{ print "\t" $0 "\t" unit_type}'
+}
+
+function select_service_and_act() {
+  local -i rofi_result=0
+  local -i rofi_exit=0
+
+  local msg="$1"
+  [[ $2 -eq 1 ]] && msg="$msg:failed"
+
+  rofi_result=$(
+    awk -v "maxlen=$rofi_service_maxlen" '{
+        $1 = gensub(/\\x/, "", "g", $1)
+        if (length($1) > maxlen) {
+          $1 = substr($1, 1, maxlen - 1) "…"
+        }
+        print $0
+      }' |
+      column --table --output-width 1 |
+      awk '{
+        state=$2
+
+        green="#a2e0ca"
+        red="#ff7a75"
+        white="#d7cfe6"
+
+        circle_filled=""
+        circle_hollow=""
+
+        icon=circle_filled
+        color=white
+
+        switch (state) {
+        case "active":
+          color=green
+          icon=circle_filled
+          break
+        case "activating":
+        case "reloading":
+          color=green
+          icon=circle_hollow
+          break
+        case "inactive":
+          color=white
+          icon=circle_filled
+          break
+        case "deactivating":
+          color=white
+          icon=circle_hollow
+          break
+        case "failed":
+        case "error":
+          color=red
+          icon=circle_filled
+          break
+        default:
+          color=white
+          icon="?"
+        }
+        print "<span size=\"small\" color=\"" color "\">" icon "</span> " $0
+      }' |
+      rofi -dmenu -markup-rows -format i -i \
+        -async-pre-read 0 \
+        -p "[$msg] systemd unit" \
+        -mesg "<span weight='light' size='small'>${bindings_help}</span>" \
+        -kb-custom-1 "${bindings[enable]}" \
+        -kb-custom-2 "${bindings["enable-now"]}" \
+        -kb-custom-3 "${bindings[disable]}" \
+        -kb-custom-4 "${bindings["disable-now"]}" \
+        -kb-custom-5 "${bindings[stop]}" \
+        -kb-custom-6 "${bindings[start]}" \
+        -kb-custom-7 "${bindings[restart]}" \
+        -kb-custom-8 "${bindings[journal]}" \
+        -kb-custom-9 "${bindings[status]}" \
+        -kb-custom-10 "${bindings["reset-failed"]}"
+  ) || rofi_exit=$?
+
+  case $rofi_exit in
+  1) action="exit" ;;
+  10) action="enable" ;;
+  11) action="enable-now" ;;
+  12) action="disable" ;;
+  13) action="disable-now" ;;
+  14) action="stop" ;;
+  15) action="start" ;;
+  16) action="restart" ;;
+  17) action="journal" ;;
+  18) action="status" ;;
+  19) action="reset-failed" ;;
+  *) action="$default_action" ;;
+  esac
+
+  [[ "$action" == "exit" ]] && exit 0
+
+  local -a res
+  local selection service_name service_is_user
+  mapfile -tn 1 -s "$rofi_result" res <"$CACHE_FILE"
+  if [[ ! -v res[0] || -z "${res[0]}" ]]; then
+    echo "$0 failed: unit not found (index $rofi_result, code $rofi_exit)" >&2
+    exit 1
+  fi
+  selection="${res[0]}"
+  eval "$(awk '
+    {
+      print    "service_name=\"" $1 "\""
+      print "service_is_user=\"" $4 "\""
+    }
+  ' <<<"$selection")"
+
+  case "$service_is_user" in
+  user*)
+    c_user=1
+    ;;
+  system*)
+    c_sudo=1
+    ;;
+  esac
+
+  get_command_with_args || {
+    local -i c=$?
+    case $c in
+    3)
+      return 0
+      ;;
+    *)
+      return "$c"
+      ;;
+    esac
+  }
+
+  local -a sw_exec_args=(-s)
+  if [[ $c_term -eq 1 ]]; then
+    cmd_args=("-e" "$cmd" "${cmd_args[@]}")
+    cmd="$term"
+    sw_exec_args=(-q)
+  fi
+  "$exec" "${sw_exec_args[@]}" -- "$cmd" "${cmd_args[@]}"
+}
+
+function get_command_with_args() {
+  local user=""
+  [[ $c_user -eq 1 ]] && user="--user"
+  case "$action" in
+  status)
+    c_term=1
+    cmd="sh"
+    cmd_args=(
+      "-c"
+      "echo -e '\033]2;$service_name\007' # set terminal title
+       {
+         SYSTEMD_COLORS=1 systemctl --no-pager -o cat ${user} status '$service_name' || \
+           echo 'error getting status for $service_name'
+       } | less --raw-control-chars"
+    )
+    ;;
+  journal)
+    c_term=1
+    cmd="sh"
+    cmd_args=(
+      "-c"
+      "echo -e '\033]2;$service_name\007' # set terminal title
+       echo '$service_name'
+       journalctl ${user} --follow --lines=1000 --unit '$service_name'"
+    )
+    ;;
+  list_actions)
+    local -i idx
+    idx="$(
+      rofi -dmenu -format i -i -p "[select action] $service_name" \
+        <<<"$(
+          printf '  %s\n' "${actions[@]}"
+          echo "← back"
+        )"
+    )"
+    local -i res=$?
+    if [[ $res -ne 0 || ! -v actions[$idx] ]]; then
+      rofi-systemd "${OPTS[@]}"
+      return 3
+    fi
+    action="${actions[idx]}"
+    get_command_with_args
+    ;;
+  *)
+    cmd="systemctl"
+    if [[ $c_sudo -eq 1 ]]; then
+      cmd_args=("$cmd")
+      cmd="sudo"
+    fi
+    if [[ "$action" =~ -now$ ]]; then
+      action="${action/-now/}"
+      cmd_args+=("--now")
+    fi
+    cmd_args+=("$action")
+    [[ -n "$user" ]] && cmd_args+=("$user")
+    cmd_args+=("$service_name")
+    ;;
+  esac
+}
+
+function rofi-systemd() {
+  local -a get_units_opts=()
+
+  local -i c_sys=0
+  local -i c_usr=0
+  local -i c_failed=0
+  local -i c_cache=1
+
+  local -i OPTIND
+  local OPTARG opt
+  while getopts "hfC" opt "${OPTS[@]}"; do
+    case "$opt" in
+    h)
+      usage
+      exit 0
+      ;;
+    f)
+      c_failed=1
+      get_units_opts+=(--failed)
+      ;;
+    C)
+      c_cache=0
+      ;;
+    \?)
+      usage
+      exit 1
+      ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+
+  local context="${1:-all}"
+
+  case "$context" in
+  system)
+    c_sys=1
+    c_usr=0
+    ;;
+  user)
+    c_sys=0
+    c_usr=1
+    ;;
+  all)
+    c_sys=1
+    c_usr=1
+    ;;
+  *)
+    echo "$prog: invalid context $context (valid: system, user, all)" >&2
+    usage
+    return 1
+    ;;
+  esac
+
+  {
+    [[ $c_cache -eq 1 && -s "$CACHE_FILE" ]] && {
+      cat "$CACHE_FILE"
+      return 0
+    }
+    [[ $c_usr -eq 1 ]] && get_units "${get_units_opts[@]}" user
+    [[ $c_sys -eq 1 ]] && get_units "${get_units_opts[@]}" system
+  } | sort -u -k1,1 |
+    sort -k2,2 |
+    {
+      if ! [[ -s "$CACHE_FILE" ]]; then
+        tee "$CACHE_FILE"
+      else
+        cat -
+      fi
+    } |
+    select_service_and_act "$context" "$c_failed"
+}
+
+rofi-systemd "${OPTS[@]}"
