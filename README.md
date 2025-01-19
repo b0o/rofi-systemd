@@ -2,6 +2,8 @@
 
 A rofi frontend for controlling systemd units.
 
+![2025-01-19_13-16-14_region](https://github.com/user-attachments/assets/4c4cd7e8-ccf1-4756-b8e2-c4137d0c33e1)
+
 ## Installation
 
 Download the script and put it somewhere in your `$PATH`.
